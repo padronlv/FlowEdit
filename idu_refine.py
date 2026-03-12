@@ -6,7 +6,7 @@ from diffusers import StableDiffusion3Pipeline
 from diffusers import FluxPipeline
 from PIL import Image
 import argparse
-import random 
+import random
 import numpy as np
 import yaml
 import os
@@ -26,7 +26,7 @@ def numpy_to_pil(numpy_img):
     # Ensure the array is uint8
     if numpy_img.dtype != np.uint8:
         numpy_img = (numpy_img * 255 + 0.5).clip(0, 255).astype(np.uint8)
-    
+
     # Handle different number of channels
     if len(numpy_img.shape) == 2:
         # Grayscale
@@ -38,21 +38,8 @@ def numpy_to_pil(numpy_img):
         elif numpy_img.shape[2] == 4:
             # RGBA
             return Image.fromarray(numpy_img, mode='RGBA')
-    
+
     raise ValueError("Unsupported array shape")
-
-def _find_offload_gpu(exclude_gpu):
-    """Return the GPU index with the most free memory, skipping exclude_gpu."""
-    best_gpu, best_free = exclude_gpu, 0
-    for i in range(torch.cuda.device_count()):
-        if i == exclude_gpu:
-            continue
-        free, _ = torch.cuda.mem_get_info(i)
-        if free > best_free:
-            best_free, best_gpu = free, i
-    print(f"FlowEdit: offloading to GPU {best_gpu} ({best_free / 1024**3:.1f} GiB free).")
-    return best_gpu
-
 
 class FlowEditRefineIDU:
     def __init__(self, save_path, device="cuda:0", model_type="FLUX"):
@@ -60,21 +47,16 @@ class FlowEditRefineIDU:
         self.save_path = save_path
         self.model_type = model_type
         if model_type == 'FLUX':
+            # pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-schnell", torch_dtype=torch.float16)
             pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-dev", torch_dtype=torch.float16)
         elif model_type == 'SD3':
             pipe = StableDiffusion3Pipeline.from_pretrained("stabilityai/stable-diffusion-3-medium-diffusers", torch_dtype=torch.float16)
         else:
             raise NotImplementedError(f"Model type {model_type} not implemented")
         self.scheduler = pipe.scheduler
-        # Sequential CPU offload moves one layer at a time to GPU, so only
-        # ~500 MiB of free VRAM is needed — robust on shared servers where
-        # a full submodel (~16 GiB) may not fit. Dynamically picks the GPU
-        # with the most free memory, excluding the Gaussian training GPU.
-        training_gpu = int(self.device.split(":")[-1]) if ":" in self.device else 0
-        offload_gpu = _find_offload_gpu(exclude_gpu=training_gpu)
-        pipe.enable_sequential_cpu_offload(gpu_id=offload_gpu)
+        gpu_id = int(self.device.split(":")[-1]) if ":" in self.device else 0
+        pipe.enable_model_cpu_offload(gpu_id=gpu_id)
         self.pipe = pipe
-        self.vae_device = torch.device(f"cuda:{offload_gpu}")
         os.makedirs(save_path, exist_ok=True)
         print(f"Initialized FlowEdit with {model_type} model.")
 
@@ -92,16 +74,17 @@ class FlowEditRefineIDU:
         """Context manager for efficient model loading."""
         with torch.inference_mode():  # Use inference mode
             yield
-    
+
     def run_single_image(self, img, src_prompt, tar_prompt, T_steps, n_avg, src_guidance_scale, tar_guidance_scale, n_min, n_max):
         img = numpy_to_pil(img)
         img = img.crop((0, 0, img.width - img.width % 16, img.height - img.height % 16))
         image_src = self.pipe.image_processor.preprocess(img)
-        image_src = image_src.to(self.vae_device).half()
+        image_src = image_src.to(self.device).half()
         with torch.autocast("cuda"), torch.inference_mode():
             x0_src_denorm = self.pipe.vae.encode(image_src).latent_dist.mode()
         x0_src = (x0_src_denorm - self.pipe.vae.config.shift_factor) * self.pipe.vae.config.scaling_factor
-        x0_src = x0_src.to(self.vae_device)
+        # send to cuda
+        x0_src = x0_src.to(self.device)
 
         flow_edit_func = FlowEditSD3 if self.model_type == 'SD3' else FlowEditFLUX
         if flow_edit_func is None: # Redundant, but good for clarity/future-proofing
@@ -114,14 +97,13 @@ class FlowEditRefineIDU:
 
         # Decode the edited latent representation back to an image
         x0_tar_denorm = (x0_tar / self.pipe.vae.config.scaling_factor) + self.pipe.vae.config.shift_factor
-        x0_tar_denorm = x0_tar_denorm.to(self.vae_device)
         with torch.autocast("cuda"), torch.inference_mode():
             image_tar = self.pipe.vae.decode(x0_tar_denorm, return_dict=False)[0]
         image_tar = self.pipe.image_processor.postprocess(image_tar)
 
         return image_tar[0]
 
-    
+
     @torch.no_grad()
     def run(self, imgs: List[PILImage], src_prompt=default_src_prompt, tar_prompt=default_tar_prompt, T_steps=28, n_avg=1, src_guidance_scale=1.5, tar_guidance_scale=5.5, n_min=0, n_max=15, n_max_end=None):
         assert src_prompt is not None, "Should provide source prompt"
