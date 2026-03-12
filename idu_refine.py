@@ -41,6 +41,19 @@ def numpy_to_pil(numpy_img):
     
     raise ValueError("Unsupported array shape")
 
+def _find_offload_gpu(exclude_gpu):
+    """Return the GPU index with the most free memory, skipping exclude_gpu."""
+    best_gpu, best_free = exclude_gpu, 0
+    for i in range(torch.cuda.device_count()):
+        if i == exclude_gpu:
+            continue
+        free, _ = torch.cuda.mem_get_info(i)
+        if free > best_free:
+            best_free, best_gpu = free, i
+    print(f"FlowEdit: offloading to GPU {best_gpu} ({best_free / 1024**3:.1f} GiB free).")
+    return best_gpu
+
+
 class FlowEditRefineIDU:
     def __init__(self, save_path, device="cuda:0", model_type="FLUX"):
         self.device = device
@@ -53,15 +66,15 @@ class FlowEditRefineIDU:
         else:
             raise NotImplementedError(f"Model type {model_type} not implemented")
         self.scheduler = pipe.scheduler
-        # Use GPU 1 for FlowEdit, leaving GPU 0 free for Gaussian training.
-        # enable_model_cpu_offload keeps the model on CPU and moves each
-        # submodel (VAE, transformer, etc.) to GPU one at a time as needed,
-        # so peak VRAM is just the largest submodel (~16 GiB), fitting in
-        # the RTX 6000 (23 GiB) on GPU 1.
-        gpu_id = int(self.device.split(":")[-1]) if ":" in self.device else 0
-        pipe.enable_model_cpu_offload(gpu_id=gpu_id)
+        # Sequential CPU offload moves one layer at a time to GPU, so only
+        # ~500 MiB of free VRAM is needed — robust on shared servers where
+        # a full submodel (~16 GiB) may not fit. Dynamically picks the GPU
+        # with the most free memory, excluding the Gaussian training GPU.
+        training_gpu = int(self.device.split(":")[-1]) if ":" in self.device else 0
+        offload_gpu = _find_offload_gpu(exclude_gpu=training_gpu)
+        pipe.enable_sequential_cpu_offload(gpu_id=offload_gpu)
         self.pipe = pipe
-        self.vae_device = torch.device(f"cuda:{gpu_id}")
+        self.vae_device = torch.device(f"cuda:{offload_gpu}")
         os.makedirs(save_path, exist_ok=True)
         print(f"Initialized FlowEdit with {model_type} model.")
 
