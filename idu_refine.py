@@ -46,21 +46,22 @@ class FlowEditRefineIDU:
         self.device = device
         self.save_path = save_path
         self.model_type = model_type
-        # Distribute model components across GPUs 1 and 5, leaving GPU 0 free
-        # for Gaussian training. RTX 6000 (GPU 1, 23 GiB) + RTX 5000 (GPU 5,
-        # 16 GiB) together have enough VRAM for FLUX.1-dev (~24 GiB fp16).
-        max_memory = {i: "0GiB" for i in range(torch.cuda.device_count())}
-        max_memory[1] = "20GiB"
-        max_memory[5] = "15GiB"
         if model_type == 'FLUX':
-            pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-dev", torch_dtype=torch.float16, device_map="balanced", max_memory=max_memory)
+            pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-dev", torch_dtype=torch.float16)
         elif model_type == 'SD3':
-            pipe = StableDiffusion3Pipeline.from_pretrained("stabilityai/stable-diffusion-3-medium-diffusers", torch_dtype=torch.float16, device_map="balanced", max_memory=max_memory)
+            pipe = StableDiffusion3Pipeline.from_pretrained("stabilityai/stable-diffusion-3-medium-diffusers", torch_dtype=torch.float16)
         else:
             raise NotImplementedError(f"Model type {model_type} not implemented")
         self.scheduler = pipe.scheduler
+        # Use GPU 1 for FlowEdit, leaving GPU 0 free for Gaussian training.
+        # enable_model_cpu_offload keeps the model on CPU and moves each
+        # submodel (VAE, transformer, etc.) to GPU one at a time as needed,
+        # so peak VRAM is just the largest submodel (~16 GiB), fitting in
+        # the RTX 6000 (23 GiB) on GPU 1.
+        gpu_id = int(self.device.split(":")[-1]) if ":" in self.device else 0
+        pipe.enable_model_cpu_offload(gpu_id=gpu_id)
         self.pipe = pipe
-        self.vae_device = next(self.pipe.vae.parameters()).device
+        self.vae_device = torch.device(f"cuda:{gpu_id}")
         os.makedirs(save_path, exist_ok=True)
         print(f"Initialized FlowEdit with {model_type} model.")
 
