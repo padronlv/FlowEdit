@@ -55,7 +55,7 @@ class FlowEditRefineIDU:
             raise NotImplementedError(f"Model type {model_type} not implemented")
         self.scheduler = pipe.scheduler
         gpu_id = int(self.device.split(":")[-1]) if ":" in self.device else 0
-        pipe.enable_model_cpu_offload(gpu_id=gpu_id)
+        pipe.enable_sequential_cpu_offload(gpu_id=gpu_id)
         self.pipe = pipe
         os.makedirs(save_path, exist_ok=True)
         print(f"Initialized FlowEdit with {model_type} model.")
