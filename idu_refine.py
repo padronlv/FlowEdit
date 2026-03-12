@@ -54,14 +54,22 @@ class FlowEditRefineIDU:
         else:
             raise NotImplementedError(f"Model type {model_type} not implemented")
         self.scheduler = pipe.scheduler
-        self.pipe = pipe.to(self.device)
+        # Distribute model layers across GPUs 1 and 5, leaving GPU 0 free for
+        # Gaussian training. RTX 6000 (GPU 1, 23 GiB) + RTX 5000 (GPU 5, 16 GiB)
+        # together have enough VRAM for FLUX.1-dev (~24 GiB fp16).
+        max_memory = {i: "0GiB" for i in range(torch.cuda.device_count())}
+        max_memory[1] = "20GiB"
+        max_memory[5] = "15GiB"
+        from accelerate import dispatch_model, infer_auto_device_map
+        device_map = infer_auto_device_map(pipe, max_memory=max_memory)
+        self.pipe = dispatch_model(pipe, device_map=device_map)
+        self.vae_device = next(self.pipe.vae.parameters()).device
         os.makedirs(save_path, exist_ok=True)
         print(f"Initialized FlowEdit with {model_type} model.")
 
     def __del__(self):
-        if self.pipe is not None:
+        if hasattr(self, "pipe") and self.pipe is not None:
             try:
-                self.pipe.to("cpu")  # Move to CPU before deleting
                 del self.pipe
             except Exception as e:
                 print(f"Error during model cleanup: {e}")
@@ -78,12 +86,11 @@ class FlowEditRefineIDU:
         img = numpy_to_pil(img)
         img = img.crop((0, 0, img.width - img.width % 16, img.height - img.height % 16))
         image_src = self.pipe.image_processor.preprocess(img)
-        image_src = image_src.to(self.device).half()
+        image_src = image_src.to(self.vae_device).half()
         with torch.autocast("cuda"), torch.inference_mode():
             x0_src_denorm = self.pipe.vae.encode(image_src).latent_dist.mode()
         x0_src = (x0_src_denorm - self.pipe.vae.config.shift_factor) * self.pipe.vae.config.scaling_factor
-        # send to cuda
-        x0_src = x0_src.to(self.device)
+        x0_src = x0_src.to(self.vae_device)
 
         flow_edit_func = FlowEditSD3 if self.model_type == 'SD3' else FlowEditFLUX
         if flow_edit_func is None: # Redundant, but good for clarity/future-proofing
@@ -96,6 +103,7 @@ class FlowEditRefineIDU:
 
         # Decode the edited latent representation back to an image
         x0_tar_denorm = (x0_tar / self.pipe.vae.config.scaling_factor) + self.pipe.vae.config.shift_factor
+        x0_tar_denorm = x0_tar_denorm.to(self.vae_device)
         with torch.autocast("cuda"), torch.inference_mode():
             image_tar = self.pipe.vae.decode(x0_tar_denorm, return_dict=False)[0]
         image_tar = self.pipe.image_processor.postprocess(image_tar)
